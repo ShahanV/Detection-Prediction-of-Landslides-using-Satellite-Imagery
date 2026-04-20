@@ -352,16 +352,16 @@ def load_models():
         classes=1,
         activation=None,
     )
-    unet.load_state_dict(torch.load("models/best_unet_model.pth", map_location=device))
+    unet.load_state_dict(torch.load("Sprint3/models/best_unet_model.pth", map_location=device))
     unet.eval().to(device)
 
     # 1D-CNN
     cnn = LandslideRiskCNN(num_features=6)
-    cnn.load_state_dict(torch.load("models/best_risk_cnn.pth", map_location=device))
+    cnn.load_state_dict(torch.load("Sprint3/models/best_risk_cnn.pth", map_location=device))
     cnn.eval().to(device)
 
     # Scaler
-    scaler = joblib.load("models/scaler.pkl")
+    scaler = joblib.load("Sprint3/models/scaler.pkl")
 
     return unet, cnn, scaler, device
 
