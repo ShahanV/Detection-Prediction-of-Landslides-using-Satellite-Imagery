@@ -15,6 +15,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# ── NEW IMPORTS FOR SATELLITE FETCH & GEOCODING ──
+from sentinelhub import (
+    SHConfig, BBox, CRS, DataCollection,
+    SentinelHubRequest, MimeType, bbox_to_dimensions
+)
+import folium
+from streamlit_folium import st_folium
+from geopy.geocoders import Nominatim
+
 # ─────────────────────────────────────────────
 # PAGE CONFIG
 # ─────────────────────────────────────────────
@@ -24,6 +33,15 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ─────────────────────────────────────────────
+# SENTINEL HUB CONFIG (Copernicus Data Space)
+# ─────────────────────────────────────────────
+sh_config = SHConfig()
+sh_config.sh_client_id     = "sh-67a3f8db-66e0-45c4-a103-194c12eb4372"
+sh_config.sh_client_secret = "VpnW5MCxmc0vp7B0t23TtkQ8rwXpyCwk"
+sh_config.sh_token_url     = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
+sh_config.sh_base_url      = "https://sh.dataspace.copernicus.eu"
 
 # ─────────────────────────────────────────────
 # GLOBAL CSS
@@ -352,16 +370,16 @@ def load_models():
         classes=1,
         activation=None,
     )
-    unet.load_state_dict(torch.load("Sprint3/models/best_unet_model.pth", map_location=device))
+    unet.load_state_dict(torch.load("models/best_unet_model.pth", map_location=device))
     unet.eval().to(device)
 
     # 1D-CNN
     cnn = LandslideRiskCNN(num_features=6)
-    cnn.load_state_dict(torch.load("Sprint3/models/best_risk_cnn.pth", map_location=device))
+    cnn.load_state_dict(torch.load("models/best_risk_cnn.pth", map_location=device))
     cnn.eval().to(device)
 
     # Scaler
-    scaler = joblib.load("Sprint3/models/scaler.pkl")
+    scaler = joblib.load("models/scaler.pkl")
 
     return unet, cnn, scaler, device
 
@@ -380,8 +398,85 @@ val_transform = A.Compose([
 
 
 # ─────────────────────────────────────────────
-# REAL INFERENCE FUNCTIONS
+# REAL INFERENCE & FETCH FUNCTIONS
 # ─────────────────────────────────────────────
+def fetch_sentinel_data(lat, lon, size_km=2.0):
+    """
+    Fetches both Sentinel-2 RGB (PNG) and Copernicus 30m DEM (TIFF).
+    Returns (rgb_image_array, dem_float_array) or (None, None).
+    """
+    delta = size_km / 111.0          # degrees per km (approx)
+    bbox  = BBox(
+        bbox=[lon - delta, lat - delta, lon + delta, lat + delta],
+        crs=CRS.WGS84
+    )
+    
+    # ── 1. S2 RGB REQUEST ──
+    evalscript_rgb = """
+    //VERSION=3
+    function setup() {
+      return { input: ["B04","B03","B02"], output: { bands: 3 } };
+    }
+    function evaluatePixel(s) {
+      return [2.5*s.B04, 2.5*s.B03, 2.5*s.B02]; 
+    }
+    """
+    cdse_s2 = DataCollection.SENTINEL2_L2A.define_from(
+        "cdse_s2", service_url=sh_config.sh_base_url
+    )
+    
+    req_rgb = SentinelHubRequest(
+        evalscript=evalscript_rgb,
+        input_data=[
+            SentinelHubRequest.input_data(
+                data_collection=cdse_s2,
+                time_interval=("2024-01-01", "2024-12-31"),
+                mosaicking_order="leastCC",
+            )
+        ],
+        responses=[SentinelHubRequest.output_response("default", MimeType.PNG)],
+        bbox=bbox,
+        size=[256, 256],
+        config=sh_config,
+    )
+
+    # ── 2. DEM REQUEST ──
+    evalscript_dem = """
+    //VERSION=3
+    function setup() {
+      return { input: ["DEM"], output: { bands: 1, sampleType: "FLOAT32" } };
+    }
+    function evaluatePixel(s) {
+      return [s.DEM];
+    }
+    """
+    cdse_dem = DataCollection.DEM_COPERNICUS_30.define_from(
+        "cdse_dem", service_url=sh_config.sh_base_url
+    )
+    
+    req_dem = SentinelHubRequest(
+        evalscript=evalscript_dem,
+        input_data=[SentinelHubRequest.input_data(data_collection=cdse_dem)],
+        responses=[SentinelHubRequest.output_response("default", MimeType.TIFF)],
+        bbox=bbox,
+        size=[256, 256],
+        config=sh_config,
+    )
+
+    try:
+        # Fetch RGB (returns uint8)
+        img_rgb = req_rgb.get_data()[0]
+        
+        # Fetch DEM (safely handle both 2D and 3D single-band returns)
+        dem_data = req_dem.get_data()[0]
+        dem_array = np.squeeze(dem_data)
+        
+        return img_rgb, dem_array
+    except Exception as e:
+        st.error(f"Sentinel Hub fetch failed: {e}")
+        return None, None
+
+
 def real_unet_predict(img_rgb, unet, device, threshold=0.5):
     """Run real U-Net. Returns (binary_mask, soft_prob_map)."""
     resized = cv2.resize(img_rgb, (IMG_SIZE, IMG_SIZE))
@@ -393,21 +488,28 @@ def real_unet_predict(img_rgb, unet, device, threshold=0.5):
     return binary_mask, prob_map
 
 
-def extract_real_features(img_rgb):
+def extract_real_features(img_rgb, real_dem=None):
     """
     Extract the 6 conditioning factors used during training.
-    Grayscale is used as a DEM proxy — swap `dem` for a real DEM array if available.
+    Uses real DEM array if provided, else falls back to heavily blurred grayscale.
     """
     img_resized = cv2.resize(img_rgb, (IMG_SIZE, IMG_SIZE))
-    gray = cv2.cvtColor(img_resized, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    dem  = gray   # ← swap with real DEM array here if you have one
+    
+    if real_dem is not None:
+        dem = cv2.resize(real_dem, (IMG_SIZE, IMG_SIZE)).astype(np.float32)
+    else:
+        gray = cv2.cvtColor(img_resized, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        # Apply heavy blur to prevent jagged noise if no true DEM is available
+        dem = cv2.GaussianBlur(gray, (31, 31), 0)
 
     sobel_x = cv2.Sobel(dem, cv2.CV_32F, 1, 0, ksize=3)
     sobel_y = cv2.Sobel(dem, cv2.CV_32F, 0, 1, ksize=3)
     slope   = np.sqrt(sobel_x**2 + sobel_y**2)
 
-    mean_l  = uniform_filter(gray, size=5)
-    mean_sq = uniform_filter(gray**2, size=5)
+    # Texture is based on the visual image, not the DEM
+    gray_visual = cv2.cvtColor(img_resized, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    mean_l  = uniform_filter(gray_visual, size=5)
+    mean_sq = uniform_filter(gray_visual**2, size=5)
     texture = np.sqrt(np.maximum(mean_sq - mean_l**2, 0))
 
     r = img_resized[:, :, 0].astype(np.float32)
@@ -415,8 +517,8 @@ def extract_real_features(img_rgb):
     b = img_resized[:, :, 2].astype(np.float32)
 
     return {
-        "Elevation":  dem    / (dem.max()     + 1e-8),
-        "Slope":      slope  / (slope.max()   + 1e-8),
+        "Elevation":  dem    / (dem.max()      + 1e-8),
+        "Slope":      slope  / (slope.max()    + 1e-8),
         "Aspect":     (np.arctan2(sobel_y, sobel_x + 1e-8) + np.pi) / (2 * np.pi),
         "Texture":    texture / (texture.max() + 1e-8),
         "NDVI-like":  np.clip((g - r) / (g + r + 1e-8), 0, 1),
@@ -424,9 +526,9 @@ def extract_real_features(img_rgb):
     }
 
 
-def real_risk_map(img_rgb, cnn, scaler, device):
+def real_risk_map(img_rgb, cnn, scaler, device, real_dem=None):
     """Run 1D-CNN pixel-by-pixel. Returns float32 risk map (IMG_SIZE, IMG_SIZE)."""
-    feats = extract_real_features(img_rgb)
+    feats = extract_real_features(img_rgb, real_dem)
 
     pixel_features = np.stack([
         feats["Elevation"].flatten(),
@@ -577,8 +679,8 @@ with st.sidebar:
 # ═════════════════════════════════════════════
 # MAIN TABS
 # ═════════════════════════════════════════════
-tab_analyze, tab_explore, tab_about = st.tabs(
-    ["🔬 Analyze", "📊 Explore Factors", "ℹ️ About"]
+tab_analyze, tab_location, tab_explore, tab_about = st.tabs(
+    ["🔬 Analyze", "📍 Fetch by Location", "📊 Explore Factors", "ℹ️ About"]
 )
 
 
@@ -612,6 +714,14 @@ with tab_analyze:
         img_pil = None
         if uploaded:
             img_pil = Image.open(uploaded).convert("RGB")
+        elif "fetched_img" in st.session_state:
+            img_pil = Image.fromarray(st.session_state["fetched_img"])
+            st.markdown(
+                '<div class="info-box">🛰️ Using Sentinel-2 image fetched from '
+                f'<b>{st.session_state["fetched_lat"]:.4f}, '
+                f'{st.session_state["fetched_lon"]:.4f}</b></div>',
+                unsafe_allow_html=True,
+            )
         elif use_demo:
             rng  = np.random.default_rng(99)
             demo = (rng.random((256, 256, 3)) * 80 + 60).astype(np.uint8)
@@ -651,7 +761,7 @@ with tab_analyze:
             pipeline_bar(0)
             st.markdown("""
 <div class="info-box">
-  Upload a satellite image (or click <b>Use Demo Image</b>) to run the full
+  Upload a satellite image, fetch one from the <b>📍 Location Tab</b>, or click <b>Use Demo Image</b> to run the full
   U-Net → Feature Extraction → 1D-CNN pipeline.
 </div>
 """, unsafe_allow_html=True)
@@ -726,7 +836,10 @@ with tab_analyze:
                 unsafe_allow_html=True,
             )
             with st.spinner("Extracting features & running 1D-CNN risk inference…"):
-                risk_map = real_risk_map(img_rgb, risk_cnn, scaler, DEVICE)
+                # Retrieve the true DEM array if fetched, else None
+                actual_dem = st.session_state.get("fetched_dem", None) if ("fetched_img" in st.session_state and not uploaded and not use_demo) else None
+                
+                risk_map = real_risk_map(img_rgb, risk_cnn, scaler, DEVICE, real_dem=actual_dem)
 
             risk_colored = colorize_risk(risk_map)
             blended      = overlay_risk(img_rgb, risk_colored, alpha=risk_alpha)
@@ -791,7 +904,148 @@ with tab_analyze:
 
 
 # ══════════════════════════════════════════════
-# TAB 2 — EXPLORE FACTORS
+# TAB 2 — FETCH BY LOCATION
+# ══════════════════════════════════════════════
+with tab_location:
+    st.markdown(
+        '<div class="section-label">Location Selection · Sentinel-2 Fetch</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("""
+<div class="info-box">
+  🗺️ <b>Search</b> for a place, input <b>coordinates</b> manually, or <b>click anywhere</b> on the map.
+  Then click <b>Fetch Satellite Image</b> to pull a real Sentinel-2 scene and Copernicus DEM.
+</div>
+""", unsafe_allow_html=True)
+
+    # Initialize state variables for the map
+    if "map_center" not in st.session_state:
+        st.session_state["map_center"] = [10.0889, 77.0595] # Default: Munnar
+    if "selected_point" not in st.session_state:
+        st.session_state["selected_point"] = None
+
+    col_map, col_fetch = st.columns([2, 1], gap="large")
+
+    # ── Controls Panel (Right Side) ──
+    with col_fetch:
+        # 1. Search by Text
+        st.markdown('<div class="section-label">1. Search Location</div>', unsafe_allow_html=True)
+        search_query = st.text_input("Address, City, or Landmark", placeholder="e.g., Wayanad, Kerala", label_visibility="collapsed")
+        if st.button("🔍 Search", use_container_width=True):
+            if search_query:
+                with st.spinner("Searching..."):
+                    try:
+                        geolocator = Nominatim(user_agent="terrascan_app")
+                        loc = geolocator.geocode(search_query)
+                        if loc:
+                            st.session_state["map_center"] = [loc.latitude, loc.longitude]
+                            st.session_state["selected_point"] = [loc.latitude, loc.longitude]
+                            st.rerun()
+                        else:
+                            st.error("Location not found. Try being more specific.")
+                    except Exception as e:
+                        st.error("Geocoding service unavailable.")
+
+        # 2. Manual Coordinates
+        st.markdown('<div class="section-label" style="margin-top:1.5rem;">2. Manual Coordinates</div>', unsafe_allow_html=True)
+        c_lat, c_lon = st.columns(2)
+        with c_lat:
+            man_lat = st.number_input("Latitude", value=st.session_state["map_center"][0], format="%.5f", step=0.01)
+        with c_lon:
+            man_lon = st.number_input("Longitude", value=st.session_state["map_center"][1], format="%.5f", step=0.01)
+
+        if st.button("📍 Set Coordinates", use_container_width=True):
+            st.session_state["map_center"] = [man_lat, man_lon]
+            st.session_state["selected_point"] = [man_lat, man_lon]
+            st.rerun()
+
+        # 3. Fetch Panel
+        st.markdown('<div class="section-label" style="margin-top:1.5rem;">3. Fetch Settings</div>', unsafe_allow_html=True)
+        
+        target_lat = st.session_state["selected_point"][0] if st.session_state["selected_point"] else None
+        target_lon = st.session_state["selected_point"][1] if st.session_state["selected_point"] else None
+
+        if target_lat is not None and target_lon is not None:
+            st.markdown(f"""
+<div style="background:var(--surface);border:1px solid var(--border);
+            border-radius:8px;padding:0.6rem 0.8rem;font-family:monospace;
+            font-size:0.75rem;line-height:1.6;margin-bottom:0.8rem;">
+  <span style="color:#64748b;">LAT</span>&nbsp; {target_lat:.5f}<br>
+  <span style="color:#64748b;">LON</span>&nbsp; {target_lon:.5f}
+</div>
+""", unsafe_allow_html=True)
+
+            area_km = st.slider("Coverage area (km²)", 1.0, 10.0, 2.0, 0.5)
+
+            if st.button("🛰️ Fetch Satellite Image", use_container_width=True):
+                with st.spinner("Contacting Sentinel Hub for S2 & DEM…"):
+                    fetched_img, fetched_dem = fetch_sentinel_data(target_lat, target_lon, size_km=area_km)
+
+                if fetched_img is not None:
+                    # Save to session so Analyze tab can pick it up
+                    st.session_state["fetched_img"] = fetched_img
+                    st.session_state["fetched_dem"] = fetched_dem
+                    st.session_state["fetched_lat"] = target_lat
+                    st.session_state["fetched_lon"] = target_lon
+
+                    st.markdown('<div class="section-label" style="margin-top:1rem;">Fetched Image</div>', unsafe_allow_html=True)
+                    st.image(fetched_img, use_container_width=True)
+                    st.markdown("""
+<div class="info-box">
+  ✅ Image fetched! Switch to the
+  <b>🔬 Analyze</b> tab — it will load automatically.
+</div>
+""", unsafe_allow_html=True)
+        else:
+            st.markdown("""
+<div style="color:#64748b;font-size:0.82rem;font-family:monospace;
+            padding:1rem;text-align:center;border:1px dashed var(--border);
+            border-radius:8px;margin-top:1rem;">
+  No location selected yet.
+</div>
+""", unsafe_allow_html=True)
+
+    # ── Map Panel (Left Side) ──
+    with col_map:
+        m = folium.Map(
+            location=st.session_state["map_center"],
+            zoom_start=12,
+            tiles="Esri.WorldImagery",
+            attr="Esri"
+        )
+        # Adds ArcGIS satellite basemap
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            attr="Esri",
+            name="Satellite",
+        ).add_to(m)
+
+        # Place a red marker if a point has been selected
+        if st.session_state["selected_point"]:
+            folium.Marker(
+                st.session_state["selected_point"],
+                icon=folium.Icon(color="red", icon="info-sign"),
+                tooltip="Target Area"
+            ).add_to(m)
+
+        # Render the map
+        map_data = st_folium(m, width=600, height=520, key="interactive_map")
+
+        # Handle map clicks
+        if map_data and map_data.get("last_clicked"):
+            click_lat = map_data["last_clicked"]["lat"]
+            click_lon = map_data["last_clicked"]["lng"]
+            
+            curr_pt = st.session_state["selected_point"]
+            # Only rerun the app if the clicked coordinates actually changed
+            if curr_pt is None or (round(click_lat, 5) != round(curr_pt[0], 5) or round(click_lon, 5) != round(curr_pt[1], 5)):
+                st.session_state["selected_point"] = [click_lat, click_lon]
+                st.rerun()
+
+
+# ══════════════════════════════════════════════
+# TAB 3 — EXPLORE FACTORS
 # ══════════════════════════════════════════════
 with tab_explore:
     st.markdown(
@@ -862,7 +1116,7 @@ with tab_explore:
 
 
 # ══════════════════════════════════════════════
-# TAB 3 — ABOUT
+# TAB 4 — ABOUT
 # ══════════════════════════════════════════════
 with tab_about:
     c_l, c_r = st.columns([3, 2], gap="large")
